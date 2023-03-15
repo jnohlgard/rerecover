@@ -1,0 +1,32 @@
+---
+Language:        Cpp
+BasedOnStyle:    Google
+InsertBraces:    true
+InsertTrailingCommas: Wrapped
+SortIncludes:    CaseSensitive
+IncludeBlocks:   Regroup
+IncludeCategories:
+  - Regex:           '^<ext/.*\.h(pp)?>'
+    Priority:        2
+    SortPriority:    0
+    CaseSensitive:   false
+  - Regex:           '^<.*\.h(pp)?>'
+    Priority:        1
+    SortPriority:    0
+    CaseSensitive:   false
+  - Regex:           '^".*\.h(pp)?"'
+    Priority:        0
+    SortPriority:    0
+    CaseSensitive:   false
+  - Regex:           '^<.*'
+    Priority:        2
+    SortPriority:    0
+    CaseSensitive:   false
+  - Regex:           '.*'
+    Priority:        3
+    SortPriority:    0
+    CaseSensitive:   false
+BinPackArguments: false
+BinPackParameters: false
+PointerAlignment: Right
+DerivePointerAlignment: false
