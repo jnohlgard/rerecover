@@ -76,9 +76,14 @@ class RttiRecover {
   static auto scan_for_typeinfo(LIEF::ELF::Binary &binary)
       -> std::expected<dependency_map, RerecoverError>;
 
-  static auto init_dependency_map(LIEF::Binary &binary) -> dependency_map;
-
  private:
+  auto scan_section_for_typeinfo(LIEF::ELF::Binary &binary,
+                                 LIEF::ELF::Section &section)
+      -> std::expected<dependency_map, RerecoverError>;
+
+  void init_cti_addrs(LIEF::Binary &binary);
+  void init_dependency_map(LIEF::Binary &binary);
+  ClassNode *parse_typeinfo(LIEF::ELF::Binary &binary, addr_type addr);
   static LIEF::ELF::Symbol typeinfo_name(std::string_view name_without_prefix,
                                          addr_type address);
   static LIEF::ELF::Symbol typeinfo_obj(std::string_view name_without_prefix,
@@ -88,17 +93,101 @@ class RttiRecover {
   static std::string ntbs(const LIEF::ELF::Binary &binary, addr_type address);
   static std::string add_class_info(LIEF::ELF::Binary &binary,
                                     addr_type address);
+
+  dependency_map dependencies{};
+  addr_type cti_addr{};
+  addr_type si_addr{};
+  addr_type vmi_addr{};
 };
 template <typename AddrType>
-auto RttiRecover<AddrType>::init_dependency_map(LIEF::Binary &binary)
-    -> RttiRecover::dependency_map {
-  dependency_map result;
+ClassNode *RttiRecover<AddrType>::parse_typeinfo(LIEF::ELF::Binary &binary,
+                                                 addr_type ti_addr) {
+  if (ti_addr == 0) {
+    return nullptr;
+  }
+  if (auto it = dependencies.find(ti_addr); it != end(dependencies)) {
+    const auto &[addr, node] = *it;
+    return node.get();
+  }
+  size_t offset = 0;
+  auto data = as_span<const addr_type>(
+      binary.get_content_from_virtual_address(ti_addr, 8000));
+  addr_type value = data[offset++];
+
+  if (value == cti_addr || value == si_addr || value == vmi_addr) {
+    std::string name;
+    if (auto name_addr = data[offset++]; name_addr != 0) {
+      name = ntbs(binary, name_addr);
+    } else {
+      name = default_class_name(ti_addr);
+    }
+
+    auto &node = [&]() -> auto & {
+      auto [it, added] =
+          dependencies.try_emplace(ti_addr, std::make_unique<ClassNode>());
+      auto &[addr, node_ptr] = *it;
+      auto ti_obj = typeinfo_obj(name, ti_addr);
+      ti_obj.size(sizeof(addr_type) * 2);
+      node_ptr->symbol = &binary.add_static_symbol(ti_obj);
+      return *node_ptr;
+    }();
+    // si_... and vmi_... are subclasses of __class_type_info, handle the extra
+    // fields below
+    if (value == si_addr) {
+      // single inheritance
+      auto base_ti_addr = data[offset++];
+      node.symbol->size(sizeof(addr_type) * offset);
+
+      if (auto dep = parse_typeinfo(binary, base_ti_addr)) {
+        node.deps.push_back(dep);
+      } else {
+        std::cerr << std::hex << ti_addr << ": Missing class info for " << name
+                  << " dependency @" << std::hex << base_ti_addr << std::endl;
+      }
+    } else if (value == vmi_addr) {
+      // virtual or multiple inheritance
+      auto flags = data[offset++];
+      auto base_count = data[offset++];
+      node.symbol->size(sizeof(addr_type) * (offset + base_count * 2));
+      for (addr_type idx = 0; idx < base_count; ++idx) {
+        auto base_ti_addr = data[offset++];
+        auto base_offset_flags = data[offset++];
+        if (auto dep = parse_typeinfo(binary, base_ti_addr)) {
+          node.deps.push_back(dep);
+        } else {
+          std::cerr << std::hex << ti_addr << ": Missing class info for "
+                    << name << " dependency @" << std::hex << base_ti_addr
+                    << std::endl;
+        }
+      }
+    }
+    return &node;
+  }
+  return nullptr;
+}
+template <typename AddrType>
+void RttiRecover<AddrType>::init_cti_addrs(LIEF::Binary &binary) {
+  if (const auto *class_type_info_vtable =
+          binary.get_symbol(SymbolNames::class_type_info)) {
+    cti_addr = class_type_info_vtable->value() + 2 * sizeof(addr_type);
+  }
+  if (const auto *si_class_type_info_vtable =
+          binary.get_symbol(SymbolNames::si_class_type_info)) {
+    si_addr = si_class_type_info_vtable->value() + 2 * sizeof(addr_type);
+  }
+  if (const auto *vmi_class_type_info_vtable =
+          binary.get_symbol(SymbolNames::vmi_class_type_info)) {
+    vmi_addr = vmi_class_type_info_vtable->value() + 2 * sizeof(addr_type);
+  }
+}
+
+template <typename AddrType>
+void RttiRecover<AddrType>::init_dependency_map(LIEF::Binary &binary) {
   for (auto &sym : binary.symbols()) {
     if (sym.name().starts_with(NamePrefix::typeinfo_obj)) {
-      result.try_emplace(sym.value(), std::make_unique<ClassNode>(&sym));
+      dependencies.try_emplace(sym.value(), std::make_unique<ClassNode>(&sym));
     }
   }
-  return result;
 }
 template <typename AddrType>
 std::string RttiRecover<AddrType>::add_class_info(LIEF::ELF::Binary &binary,
@@ -117,9 +206,11 @@ std::string RttiRecover<AddrType>::add_class_info(LIEF::ELF::Binary &binary,
 template <typename AddrType>
 std::string RttiRecover<AddrType>::ntbs(const LIEF::ELF::Binary &binary,
                                         addr_type address) {
-  // not bounds checked:
-  return std::string(reinterpret_cast<const char *>(
-      binary.get_content_from_virtual_address(address, 240).data()));
+  // get_content_from_virtual_address will clamp the size, so we don't read out
+  // of bounds
+  auto data = binary.get_content_from_virtual_address(address, 8000);
+  auto end = std::ranges::find(data, '\0');
+  return {data.begin(), end};
 }
 
 template <typename AddrType>
@@ -157,17 +248,13 @@ LIEF::ELF::Symbol RttiRecover<AddrType>::typeinfo_name(
 template <typename AddrType>
 auto RttiRecover<AddrType>::scan_for_typeinfo(LIEF::ELF::Binary &binary)
     -> std::expected<dependency_map, RerecoverError> {
-  auto deps = init_dependency_map(binary);
-  const auto *class_type_info_vtable =
-      binary.get_symbol(SymbolNames::class_type_info);
-  if (class_type_info_vtable == nullptr) {
+  RttiRecover<AddrType> recover;
+  recover.init_dependency_map(binary);
+  recover.init_cti_addrs(binary);
+  if (recover.cti_addr == 0) {
     std::cerr << "No typeinfo base class references found" << std::endl;
     return std::unexpected{RerecoverError::no_rtti_usage};
   }
-  const auto *si_class_type_info_vtable =
-      binary.get_symbol(SymbolNames::si_class_type_info);
-  const auto *vmi_class_type_info_vtable =
-      binary.get_symbol(SymbolNames::vmi_class_type_info);
 
   const auto *section = binary.get_section(SectionNames::rodata);
   if (section == nullptr) {
@@ -175,54 +262,29 @@ auto RttiRecover<AddrType>::scan_for_typeinfo(LIEF::ELF::Binary &binary)
               << std::endl;
     return std::unexpected{RerecoverError::missing_rodata};
   }
-  const addr_type base_offset = section->virtual_address();
-  auto data = as_span<const addr_type>(section->content());
-  const addr_type cti_addr =
-      class_type_info_vtable->value() + 2 * sizeof(addr_type);
-  const addr_type si_addr =
-      si_class_type_info_vtable->value() + 2 * sizeof(addr_type);
-  const addr_type vmi_addr =
-      vmi_class_type_info_vtable->value() + 2 * sizeof(addr_type);
+  addr_type addr = section->virtual_address();
+  const addr_type end_addr = addr + section->size();
 
-  for (size_t offset = 0; offset < data.size(); ++offset) {
-    auto value = data[offset];
-    if (value == 0) {
-      continue;
-    }
-    auto ti_addr = offset * sizeof(addr_type) + base_offset;
-    if (deps.contains(ti_addr)) {
-      continue;
-    }
-    if (value == cti_addr || value == si_addr || value == vmi_addr) {
-      auto name = add_class_info(binary, ti_addr);
-      auto ti_obj = typeinfo_obj(name, ti_addr);
-      ti_obj.size(sizeof(addr_type) * 2);
-      ++offset;  // skip past name pointer
-      auto &symbol = binary.add_static_symbol(ti_obj);
-
-      auto &node = [&]() -> auto & {
-        auto [it, added] =
-            deps.try_emplace(ti_addr, std::make_unique<ClassNode>());
-        auto &[addr, node_ptr] = *it;
-        return *node_ptr;
-      }();
-      node.symbol = &symbol;
-      if (value == si_addr) {
-        // single inheritance
-        ++offset;
-        auto base_ti_addr = data[offset];
-        if (auto it = deps.find(base_ti_addr); it != end(deps)) {
-          auto &[addr, dep] = *it;
-          node.deps.push_back(dep.get());
-        } else {
-          std::cerr << "Missing class info for " << name
-                    << " -> " << std::hex << base_ti_addr << std::endl;
-        }
-      } else if (value == vmi_addr) {
+  while (addr < end_addr) {
+    // Attempt to parse to determine if the current address contains a type_info
+    // object.
+    if (auto node = recover.parse_typeinfo(binary, addr)) {
+      // Rounding up to nearest sizeof addr_type multiple for alignment
+      size_t consumed_bytes = (node->symbol->size() + sizeof(addr_type) - 1) &
+                              ~(sizeof(addr_type) - 1);
+      if (consumed_bytes == 0) {
+        consumed_bytes = sizeof(addr_type);
       }
+      // Skip past the whole type_info struct
+      addr += consumed_bytes;
+    } else {
+      // Nothing found here, try the next word
+      addr += sizeof(addr_type);
     }
   }
-  return deps;
+  // NB: std::move() is necessary here, C++17 RVO does not apply because we are
+  // moving from a member variable of `recover`
+  return std::move(recover.dependencies);
 }
 
 void myparse(std::string_view filename) {
