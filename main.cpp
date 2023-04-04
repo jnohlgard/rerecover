@@ -155,15 +155,24 @@ class RttiRecover {
     Inheritance flags{};
   };
   struct Typeinfo {
+    /// The ELF symbol for this typeinfo
     LIEF::Symbol *symbol{};
+    /// A copy of the mangled name of this type
     std::string name{};
+    /// Virtual memory address of the name inside the binary
     addr_type name_addr{};
-    // Primary vtable for this class, i.e. not secondary vtables of other
-    // classes and not construction vtables
+    /// Primary vtable for this class, i.e. not secondary vtables of other
+    /// classes and not construction vtables
     Vtable *primary_vtable{};
+    /// Estimated number of vtables in the primary vtable group for this type
+    size_t expected_vtable_group_size{};
+    /// number of vbase offsets in the vtable object
+    size_t count_vbase_offsets{};
+    /// number of vcall offsets in the vtable object
+    size_t count_vcall_offsets{};
     /// Base classes for this class
     std::vector<TypeinfoDep> base_classes{};
-    // All vtables for this class, ungrouped and including the primary vtable.
+    /// All vtables for this class, ungrouped and including the primary vtable.
     std::vector<Vtable *> vtables{};
   };
   struct Vtable {
@@ -209,12 +218,12 @@ class RttiRecover {
   void scan_section_for_vtt(LIEF::ELF::Binary &binary,
                             const LIEF::ELF::Section &section);
   void guess_primary_vtables();
-  void create_vtable_symbols(LIEF::ELF::Binary &binary);
+  void create_vtable_symbols(LIEF::ELF::Binary &binary,
+                             const Typeinfo &typeinfo);
   void create_function_symbols_for_class(LIEF::ELF::Binary &binary,
                                          const Typeinfo &typeinfo);
   auto step_past_typeinfo(addr_type addr) const -> addr_type;
 
-  void import_existing_function_symbols(const LIEF::ELF::Binary &binary);
   void init_cti_addrs(const LIEF::Binary &binary);
   void init_dependency_map(LIEF::Binary &binary);
   void init_content_class(const LIEF::ELF::Binary &binary);
@@ -230,6 +239,7 @@ class RttiRecover {
   static std::string default_class_name(addr_type address);
   /// Extract null-terminated byte string
   static std::string ntbs(const LIEF::ELF::Binary &binary, addr_type address);
+  static int count_vtables(Typeinfo &typeinfo);
   std::unique_ptr<Typeinfo> add_class_info(LIEF::ELF::Binary &binary,
                                            const std::string &name,
                                            addr_type typeinfo_addr);
@@ -241,7 +251,6 @@ class RttiRecover {
   /// sequence numbering used for generated symbol names
   int vfunc_seq{};
   std::map<addr_type, Content> content_class;
-  std::map<addr_type, std::string> function_addr_name;
   std::set<const Typeinfo *> processed_vtables;
   /// Typeinfo objects found
   // keys are address of the typeinfo
@@ -256,6 +265,25 @@ class RttiRecover {
   uint16_t rodata_shndx{14};
   uint16_t text_shndx{12};
 };
+
+template <std::unsigned_integral AddrType>
+int RttiRecover<AddrType>::count_vtables(RttiRecover::Typeinfo &typeinfo) {
+  if (typeinfo.expected_vtable_group_size < 1) {
+    if (typeinfo.base_classes.empty()) {
+      typeinfo.expected_vtable_group_size = 1;
+    } else {
+      typeinfo.expected_vtable_group_size = 0;
+      for (auto &&dep : typeinfo.base_classes) {
+        if (std::to_underlying(dep.flags) &
+            std::to_underlying(Inheritance::virtual_mask)) {
+          ++typeinfo.count_vbase_offsets;
+        }
+        typeinfo.expected_vtable_group_size += count_vtables(*dep.typeinfo);
+      }
+    }
+  }
+  return typeinfo.expected_vtable_group_size;
+}
 
 template <std::unsigned_integral AddrType>
 auto RttiRecover<AddrType>::step_past_typeinfo(addr_type addr) const
@@ -339,6 +367,7 @@ void RttiRecover<AddrType>::scan_section_for_vtt(
 
 template <std::unsigned_integral AddrType>
 void RttiRecover<AddrType>::guess_primary_vtables() {
+  Typeinfo *prev_typeinfo_ptr = nullptr;
   for (auto &&[addr, vtable] : vtables) {
     // we guess that the vtable with the lowest address is the primary vtable
     // for any given class that lacks a VTT
@@ -346,21 +375,53 @@ void RttiRecover<AddrType>::guess_primary_vtables() {
       vtable.typeinfo->primary_vtable = &vtable;
     }
   }
+  for (auto &&[addr, typeinfo_ptr] : typeinfos) {
+    auto &&typeinfo = *typeinfo_ptr;
+    auto expected_count = count_vtables(typeinfo);
+    if (typeinfo.vtables.size() < expected_count ||
+        typeinfo.vtables.size() % expected_count != 0) {
+      std::cerr << "Fewer vtables than expected for " << typeinfo.name << " @ "
+                << std::hex << addr << ", expected: " << std::dec
+                << expected_count << ", found: " << typeinfo.vtables.size()
+                << std::endl;
+    }
+  }
 }
 
 template <std::unsigned_integral AddrType>
-void RttiRecover<AddrType>::create_vtable_symbols(LIEF::ELF::Binary &binary) {
-  for (auto &&[addr, typeinfo] : typeinfos) {
-    if (!typeinfo.vtables.empty()) {
-      auto vtable_symbol =
-          make_symbol(typeinfo.name,
-                      typeinfo.primary_vtable->func_table_begin,
-                      NamePrefix::vtable);
-      vtable_symbol.size(vtables[typeinfo.vtables.back()].func_table_end -
-                         vtables[typeinfo.primary_vtable].func_table_begin);
-      vtable_symbol.shndx(rodata_shndx);
-      binary.add_static_symbol(vtable_symbol);
-    }
+void RttiRecover<AddrType>::create_vtable_symbols(LIEF::ELF::Binary &binary,
+                                                  const Typeinfo &typeinfo) {
+  if (typeinfo.primary_vtable != nullptr) {
+    const auto is_primary_vtable = [primary_vtable_ptr =
+                                        typeinfo.primary_vtable](auto &&item) {
+      auto &&[addr, vtable] = item;
+      return primary_vtable_ptr == &vtable;
+    };
+    const auto is_same_vtable_group = [&typeinfo](auto &&item) {
+      auto &&[addr, vtable] = item;
+      return vtable.typeinfo->name_addr == typeinfo.name_addr;
+    };
+    auto primary_vt_group =
+        std::ranges::subrange(std::ranges::find_if(vtables, is_primary_vtable),
+                              end(vtables)) |
+        std::views::take(typeinfo.expected_vtable_group_size) |
+        std::views::take_while(is_same_vtable_group);
+    auto &primary_vtable = *typeinfo.primary_vtable;
+    // The vtable pointer points at the first function pointer in the table, but
+    // the vtable object contains some data before the first function pointer:
+    // exactly one offset-to-top, zero to many vbase offsets, vcall offsets
+    primary_vtable.global_symbol_addr =
+        primary_vtable.func_table_begin -
+        sizeof(addr_type) *
+            (1 + typeinfo.count_vbase_offsets + typeinfo.count_vcall_offsets);
+    auto vtable_symbol = make_symbol(
+        typeinfo.name, primary_vtable.global_symbol_addr, NamePrefix::vtable);
+    auto vtable_group_end =
+        std::ranges::max(primary_vt_group | std::views::values |
+                         std::views::transform(&Vtable::func_table_end));
+    vtable_symbol.size(vtable_group_end - primary_vtable.global_symbol_addr);
+    vtable_symbol.shndx(rodata_shndx);
+    binary.add_static_symbol(vtable_symbol);
   }
 }
 
@@ -486,8 +547,6 @@ void RttiRecover<AddrType>::create_symbol_for_vfptr(
   }
   symbol_name.append(unqualified_func_name).append("Ev");
   binary.add_exported_function(vfptr_value, symbol_name);
-  std::cout << "Added " << symbol_name << " @ " << std::hex << vfptr_value
-            << std::endl;
 }
 
 template <std::unsigned_integral AddrType>
@@ -770,25 +829,6 @@ LIEF::ELF::Symbol RttiRecover<AddrType>::typeinfo_name(
 }
 
 template <std::unsigned_integral AddrType>
-void RttiRecover<AddrType>::import_existing_function_symbols(
-    const LIEF::ELF::Binary &binary) {
-  for (auto &&symbol : binary.symbols()) {
-    if (symbol.value() != 0 &&
-        symbol.type() == LIEF::ELF::ELF_SYMBOL_TYPES::STT_FUNC &&
-        !symbol.name().empty()) {
-      function_addr_name.try_emplace(symbol.value(), symbol.name());
-    }
-  }
-  //  std::ranges::for_each(
-  //      binary.functions() | std::views::filter([](auto &&symbol) {
-  //        return symbol.value() != 0 && !symbol.name().empty();
-  //      }),
-  //      [this](auto &&symbol) {
-  //        function_addr_name.try_emplace(symbol.value(), symbol.name());
-  //      });
-}
-
-template <std::unsigned_integral AddrType>
 auto RttiRecover<AddrType>::scan_for_typeinfo(LIEF::ELF::Binary &binary)
     -> std::expected<typeinfo_map, RerecoverError> {
   RttiRecover<AddrType> recover;
@@ -809,11 +849,12 @@ auto RttiRecover<AddrType>::scan_for_typeinfo(LIEF::ELF::Binary &binary)
     recover.processed_vtables.clear();
     if (auto symbol = binary.get_symbol(SymbolNames::cxa_pure_virtual)) {
       recover.cxa_pure_virtual_addr = symbol->value();
-      recover.function_addr_name[recover.cxa_pure_virtual_addr] = "";
     }
     for (auto &&it : recover.typeinfos) {
       auto &&[addr, typeinfo_ptr] = it;
-      recover.create_function_symbols_for_class(binary, *typeinfo_ptr);
+      auto &&typeinfo = *typeinfo_ptr;
+      recover.create_vtable_symbols(binary, typeinfo);
+      recover.create_function_symbols_for_class(binary, typeinfo);
     }
 
     // NB: std::move() is necessary here, C++17 RVO does not apply because we
