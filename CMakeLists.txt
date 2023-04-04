@@ -26,3 +26,5 @@ endif ()
 
 add_executable(rerecover main.cpp)
 target_link_libraries(rerecover PRIVATE LIEF::LIEF)
+
+add_subdirectory(subjects)
