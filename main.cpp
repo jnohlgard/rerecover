@@ -70,6 +70,7 @@ struct NamePrefix {
   static constexpr const auto vtable = "_ZTV"sv;
   static constexpr const auto vtt = "_ZTT"sv;
   static constexpr const auto member_function = "_ZN"sv;
+  static constexpr const auto thunk_function = "_ZTh"sv;
 };
 
 /// Error codes returned from some API functions
@@ -176,9 +177,11 @@ class RttiRecover {
     std::vector<Vtable *> vtables{};
   };
   struct Vtable {
+    struct VfuncPtr;
     struct VfuncPtr {
       addr_type value{};
       std::string unqualified_name{};
+      VfuncPtr *wraps{};
     };
     Typeinfo *typeinfo{};
     /**
@@ -429,28 +432,32 @@ template <std::unsigned_integral AddrType>
 void RttiRecover<AddrType>::create_function_symbols_for_class(
     LIEF::ELF::Binary &binary, const RttiRecover::Typeinfo &typeinfo) {
   if (typeinfo.vtables.empty()) {
+    std::cerr << "Missing vtable for " << typeinfo.name << std::endl;
     return;
   }
-  if (processed_vtables.contains(&typeinfo)) {
+  if (auto [it, was_added] = processed_vtables.insert(&typeinfo); !was_added) {
+    // Already processed
     return;
   }
-  processed_vtables.insert(&typeinfo);
   // Depth-first to get to the base classes
-  constexpr auto is_virtual_class = [](auto &&dep) {
+  constexpr auto is_virtual_base = [](auto &&dep) {
     return 0 != (std::to_underlying(dep.flags) &
                  std::to_underlying(Inheritance::virtual_mask));
   };
-  constexpr auto is_non_virtual_class = [](auto &&dep) {
-    return !is_virtual_class(dep);
+  constexpr auto is_non_virtual_base = [](auto &&dep) {
+    return !is_virtual_base(dep);
   };
   constexpr auto typeinfo_from_dep =
       std::views::transform([](auto &&dep) -> auto & { return *dep.typeinfo; });
   constexpr auto non_virtual_bases_only =
-      std::views::filter(is_non_virtual_class) | typeinfo_from_dep;
+      std::views::filter(is_non_virtual_base) | typeinfo_from_dep;
   constexpr auto virtual_bases_only =
-      std::views::filter(is_virtual_class) | typeinfo_from_dep;
-  const auto has_implementation = [this](auto &&vfptr) {
+      std::views::filter(is_virtual_base) | typeinfo_from_dep;
+  auto has_implementation = [this](auto &&vfptr) {
     return vfptr.value != 0 && vfptr.value != cxa_pure_virtual_addr;
+  };
+  constexpr auto is_unnamed = [](auto &&vfptr) {
+    return vfptr.unqualified_name.empty();
   };
 
   for (auto &&base : typeinfo.base_classes | typeinfo_from_dep) {
@@ -470,83 +477,131 @@ void RttiRecover<AddrType>::create_function_symbols_for_class(
       typeinfo.vtables | std::views::transform([](auto &&vtable_ptr) -> auto & {
         return *vtable_ptr;
       });
+  auto &primary_vtable = *typeinfo.primary_vtable;
   if (base_vtables.empty()) {
     // Assume that for classes without bases and with exactly two virtual
     // functions that are not pure virtual, that those two functions are the
-    // virtual destructor pair
-    for (auto &&vfuncptrs :
-         derived_vtables | std::views::transform(&Vtable::vfuncptrs) |
-             std::views::filter([&has_implementation](auto &&vfuncptrs) {
-               return std::ranges::count_if(vfuncptrs, has_implementation) == 2;
-             })) {
+    // virtual destructor pair: D1, D0
+    if (std::ranges::count_if(primary_vtable.vfuncptrs, has_implementation) ==
+        2) {
       auto implemented_vfuncs =
-          vfuncptrs | std::views::filter(has_implementation);
+          primary_vtable.vfuncptrs | std::views::filter(has_implementation);
       auto vfunc_it = begin(implemented_vfuncs);
       // Order of dtor pair in Itanium C++ ABI is: D1, D0
       (vfunc_it++)->unqualified_name = SymbolNames::complete_object_destructor;
       (vfunc_it++)->unqualified_name = SymbolNames::deleting_destructor;
     }
-  }
-  auto base_vtable_it = begin(base_vtables);
-  auto base_vtables_end = end(base_vtables);
-  for (auto &&derived_vtable : derived_vtables) {
-    if (base_vtable_it != base_vtables_end) {
+  } else {
+    auto unnamed_vfuncptrs =
+        primary_vtable.vfuncptrs | std::views::filter(is_unnamed);
+    auto unnamed_vfuncptr_it = begin(unnamed_vfuncptrs);
+    auto unnamed_vfuncptr_end = end(unnamed_vfuncptrs);
+    const auto &primary_base_primary_vtable = base_vtables.front();
+    if (primary_vtable.vfuncptrs.size() <
+        primary_base_primary_vtable.vfuncptrs.size()) {
+      std::cerr << "Derived vtable too small! " << typeinfo.name << " vtable @ "
+                << primary_vtable.func_table_begin << " base "
+                << primary_base_primary_vtable.func_table_begin << std::endl;
+      return;
+    }
+    // Copy the method names from the primary vtable of the primary base, these
+    // should always match between the derived and the base, regardless if they
+    // are inherited or overridden
+    std::ranges::copy(
+        primary_base_primary_vtable.vfuncptrs |
+            std::views::transform(&Vtable::VfuncPtr::unqualified_name),
+        (primary_vtable.vfuncptrs |
+         std::views::transform(&Vtable::VfuncPtr::unqualified_name))
+            .begin());
+    // std::views::zip would simplify this part:
+    auto secondary_vtables = derived_vtables | std::views::drop(1);
+    auto secondary_base_vtables = base_vtables | std::views::drop(1);
+    auto base_vtable_it = begin(secondary_base_vtables);
+    auto base_vtables_end = end(secondary_base_vtables);
+    for (auto &&derived_vtable : secondary_vtables) {
+      if (base_vtable_it == base_vtables_end) {
+        std::cerr << "Too few base vtables for " << typeinfo.name
+                  << ", TODO: implement construction "
+                     "vtable symbolication"
+                  << std::endl;
+        break;
+      }
       auto &&base_vtable = *base_vtable_it++;
-      auto derived_vfunc_names =
-          derived_vtable.vfuncptrs |
-          std::views::transform(&Vtable::VfuncPtr::unqualified_name);
-      auto base_vfunc_names =
-          base_vtable.vfuncptrs |
-          std::views::transform(&Vtable::VfuncPtr::unqualified_name);
-      auto derived_vfunc_it = begin(derived_vfunc_names);
-      auto derived_vfunc_end = end(derived_vfunc_names);
-      for (auto &&base_vfunc_name : base_vfunc_names) {
-        if (derived_vfunc_it == derived_vfunc_end) {
-          std::cerr << "derived vtable @ " << std::hex
-                    << derived_vtable.func_table_begin
-                    << " too short, expected " << std::dec
-                    << base_vtable.vfuncptrs.size() << ", got "
-                    << derived_vtable.vfuncptrs.size() << std::endl;
-          break;
+      if (derived_vtable.vfuncptrs.size() != base_vtable.vfuncptrs.size()) {
+        std::cerr << "derived vtable @ " << std::hex
+                  << derived_vtable.func_table_begin
+                  << " size mismatch, expected " << std::dec
+                  << base_vtable.vfuncptrs.size() << ", got "
+                  << derived_vtable.vfuncptrs.size() << std::endl;
+        break;
+      }
+      auto base_vfunc_it = begin(base_vtable.vfuncptrs);
+      for (auto &&derived_vfuncptr : derived_vtable.vfuncptrs) {
+        auto &&base_vfuncptr = *base_vfunc_it++;
+        derived_vfuncptr.unqualified_name = base_vfuncptr.unqualified_name;
+        if (derived_vfuncptr.value != base_vfuncptr.value) {
+          // Thunk function to overridden method, the actual override function
+          // is found in the primary vtable for the derived class.
+          if (auto overrider_vfunc_it =
+                  std::ranges::find(primary_vtable.vfuncptrs,
+                                    base_vfuncptr.unqualified_name,
+                                    &Vtable::VfuncPtr::unqualified_name);
+              overrider_vfunc_it != end(primary_vtable.vfuncptrs)) {
+            // Override function already exists in the primary vtable.
+            derived_vfuncptr.wraps = &*overrider_vfunc_it;
+          } else if (unnamed_vfuncptr_it != unnamed_vfuncptr_end) {
+            // Override function does not exist in primary vtable, claim
+            // the next unnamed function pointer and name it to match the base
+            // class method
+            auto &&overrider_vfuncptr = *unnamed_vfuncptr_it++;
+            derived_vfuncptr.wraps = &overrider_vfuncptr;
+            overrider_vfuncptr.unqualified_name =
+                base_vfuncptr.unqualified_name;
+          }
         }
-        auto &&derived_vfunc_name = *derived_vfunc_it++;
-        derived_vfunc_name = base_vfunc_name;
       }
     }
-    std::ranges::generate(
-        derived_vtable.vfuncptrs |
-            std::views::transform(&Vtable::VfuncPtr::unqualified_name) |
-            std::views::filter(&std::string::empty),
-        [this]() {
-          std::ostringstream oss;
-          oss << "vfunc"sv << std::dec << std::setw(4) << std::setfill('0')
-              << ++vfunc_seq;
-          return std::to_string(oss.tellp()) + oss.str();
-        });
   }
-  for (auto &&vfptr :
-       derived_vtables | std::views::transform(&Vtable::vfuncptrs) |
-           std::views::join | std::views::filter(has_implementation)) {
-    create_symbol_for_vfptr(
-        binary, typeinfo, vfptr.value, vfptr.unqualified_name);
-  }
-}
+  // The remaining unnamed functions in the primary vtable are virtual
+  // functions introduced by the derived class.
+  std::ranges::generate(
+      primary_vtable.vfuncptrs | std::views::filter(is_unnamed) |
+          std::views::transform(&Vtable::VfuncPtr::unqualified_name),
+      [this]() {
+        std::ostringstream oss;
+        oss << "vfunc"sv << std::dec << std::setw(4) << std::setfill('0')
+            << ++vfunc_seq;
+        return std::to_string(oss.tellp()) + oss.str();
+      });
+  for (auto &&vtable : derived_vtables) {
+    for (auto &&vfptr :
+         vtable.vfuncptrs | std::views::filter(has_implementation)) {
+      std::ostringstream oss;
+      if (vfptr.wraps != nullptr) {
+        oss << NamePrefix::thunk_function;
+        auto offset = vtable.offset_to_top;
+        if (offset < 0) {
+          oss << "n";
+          offset = -offset;
+        }
+        oss << offset << "_N";
+      } else {
+        oss << NamePrefix::member_function;
+      }
+      if (typeinfo.name.front() == 'N' && typeinfo.name.back() == 'E') {
+        // strip enclosing "N..E"
+        oss << typeinfo.name.substr(1, typeinfo.name.size() - 2);
+      } else {
+        oss << typeinfo.name;
+      }
+      oss << vfptr.unqualified_name << "Ev";
 
-template <std::unsigned_integral AddrType>
-void RttiRecover<AddrType>::create_symbol_for_vfptr(
-    LIEF::ELF::Binary &binary,
-    const RttiRecover::Typeinfo &typeinfo,
-    addr_type vfptr_value,
-    std::string_view unqualified_func_name) {
-  auto symbol_name = std::string(NamePrefix::member_function);
-  if (typeinfo.name.front() == 'N' && typeinfo.name.back() == 'E') {
-    // strip enclosing "N..E"
-    symbol_name.append(typeinfo.name.substr(1, typeinfo.name.size() - 2));
-  } else {
-    symbol_name.append(typeinfo.name);
+      if (auto symbol_name = oss.str();
+          binary.get_symbol(symbol_name) == nullptr) {
+        binary.add_exported_function(vfptr.value, symbol_name);
+      }
+    }
   }
-  symbol_name.append(unqualified_func_name).append("Ev");
-  binary.add_exported_function(vfptr_value, symbol_name);
 }
 
 template <std::unsigned_integral AddrType>
